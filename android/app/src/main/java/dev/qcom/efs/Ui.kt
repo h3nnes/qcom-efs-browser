@@ -243,6 +243,16 @@ fun App(vm: MainViewModel) {
                                 onClick = { menu = false; vm.checkForUpdates(manual = true) },
                             )
                             if (state.phase == Phase.READY) {
+                                // Greyed while the session works: reconnecting
+                                // over a live connection would only churn the
+                                // helper.  It lights up once a failed operation
+                                // proved the connection dead.
+                                DropdownMenuItem(
+                                    text = { Text("Reconnect") },
+                                    leadingIcon = { Icon(Icons.Filled.Link, null) },
+                                    enabled = state.connectionLost,
+                                    onClick = { menu = false; vm.reconnect() },
+                                )
                                 DropdownMenuItem(
                                     text = { Text("Disconnect") },
                                     leadingIcon = { Icon(Icons.Filled.PowerSettingsNew, null) },
@@ -340,6 +350,8 @@ fun App(vm: MainViewModel) {
         BulkImportDialog(
             state = bulk,
             readOnly = state.readOnly,
+            busy = state.busy,
+            ssrDone = state.ssrDone,
             onSpcUnlock = { spc -> vm.spcUnlock(spc) },
             onEnableWrites = { vm.toggleReadOnly() },
             onStart = { spc -> vm.runBulkImport(spc) },
@@ -353,6 +365,7 @@ fun App(vm: MainViewModel) {
             state = features,
             readOnly = state.readOnly,
             busy = state.busy,
+            ssrDone = state.ssrDone,
             onSimSlot = { slot -> vm.setFeatureSimSlot(slot) },
             onEnableWrites = { vm.toggleReadOnly() },
             onDisable = { id, spc -> vm.disableFeature(id, spc) },

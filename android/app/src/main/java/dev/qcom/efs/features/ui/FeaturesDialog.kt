@@ -37,6 +37,7 @@ fun FeaturesDialog(
     state: FeaturesState,
     readOnly: Boolean,
     busy: Boolean,
+    ssrDone: Boolean,
     onSimSlot: (Int) -> Unit,
     onEnableWrites: () -> Unit,
     onDisable: (id: String, spc: String) -> Unit,
@@ -69,6 +70,7 @@ fun FeaturesDialog(
             state = state,
             busy = busy,
             readOnly = readOnly,
+            ssrDone = ssrDone,
             onSimSlot = onSimSlot,
             onEnableWrites = onEnableWrites,
             onDisable = onDisable,
@@ -84,6 +86,7 @@ private fun ReadyBody(
     state: FeaturesState.Ready,
     busy: Boolean,
     readOnly: Boolean,
+    ssrDone: Boolean,
     onSimSlot: (Int) -> Unit,
     onEnableWrites: () -> Unit,
     onDisable: (String, String) -> Unit,
@@ -194,7 +197,7 @@ private fun ReadyBody(
                     onClick = { onSsr() },
                     enabled = !busy && !acting,
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("Restart modem (SSR)") }
+                ) { Text("Restart modem (SSR)" + if (ssrDone) " - Done!" else "") }
             }
         },
         confirmButton = {
