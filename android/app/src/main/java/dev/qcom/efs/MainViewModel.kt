@@ -154,9 +154,12 @@ data class UiState(
     val update: Release? = null,
     /** Set once the session is closed and the activity should finish. */
     val exitAfterDisconnect: Boolean = false,
-    /** True after an operation proved the helper connection died. */
-    val connectionLost: Boolean = false,
-    /** True after an SSR came back with a live session; the dialogs show "Done!". */
+    /**
+     * True once a modem restart came back with a live session, so the SSR
+     * button in the bulk-import and features dialogs can say "Done!".  It
+     * belongs to the changes made before that restart: opening either dialog
+     * or writing a new feature clears it again.
+     */
     val ssrDone: Boolean = false,
 )
 
@@ -215,24 +218,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 body()
             } catch (t: Throwable) {
-                val lost = isConnectionLoss(t)
-                _state.update { it.copy(toast = describe(t), connectionLost = it.connectionLost || lost) }
+                _state.update { it.copy(toast = describe(t)) }
             } finally {
                 _state.update { it.copy(busy = false, busyLabel = null) }
             }
         }
     }
-
-    /**
-     * A failed operation only proves the connection died when the failure is
-     * transport-shaped - anything with a modem answer behind it (ENOENT,
-     * EPERM, ...) means the session is alive.  The socket itself does not
-     * notice a dead peer, so the error text has to speak for it.
-     */
-    private fun isConnectionLoss(t: Throwable): Boolean =
-        t is EfsException && (!repo.connected ||
-                t.message?.contains("not connected to the helper") == true ||
-                t.message?.contains("closed the connection") == true)
 
     private fun describe(t: Throwable): String {
         val base = t.message ?: t.javaClass.simpleName
@@ -250,84 +241,59 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun connect() {
         if (_state.value.phase == Phase.CONNECTING) return
-        _state.update { it.copy(phase = Phase.CONNECTING, error = null, connectionLost = false) }
-        viewModelScope.launch {
-            try {
-                val (info, log) = repo.connect(_state.value.verbose)
-                _state.update {
-                    it.copy(
-                        phase = Phase.READY,
-                        info = info,
-                        readOnly = info.readOnly,
-                        localEnforce = repo.enforceState(),
-                        log = log,
-                    )
-                }
-                open("/")
-            } catch (t: Throwable) {
-                _state.update {
-                    it.copy(
-                        phase = Phase.FAILED,
-                        error = describe(t),
-                        localEnforce = repo.enforceState(),
-                        log = it.log + repo.lastStartLog + repo.daemonLog(),
-                    )
-                }
-            }
-        }
+        viewModelScope.launch { if (startSession()) open("/") }
     }
 
     /**
-     * Re-does the session without leaving the browser: the phase can still
-     * say READY while the helper connection died (the app process survived a
-     * backgrounding, the helper did not), and walking back to the Connect
-     * button loses the folder.  Restores that folder afterwards; if it is
-     * gone from the modem (or unreadable), lands on the root instead.
+     * Starts a fresh helper and session from inside the browser, and puts the
+     * user back in the folder they were in -- or on the root, when that folder
+     * is gone or unreadable.  Always offered rather than only after a detected
+     * failure: a dead helper is not the only way to end up with a useless
+     * session (a modem restart sent as a raw packet leaves the helper talking
+     * to the modem that went away), and restarting a healthy helper costs two
+     * seconds and puts the read-only lock back on, nothing more.
      */
     fun reconnect() {
         if (_state.value.phase == Phase.CONNECTING) return
         val savedPath = _state.value.path
-        _state.update { it.copy(phase = Phase.CONNECTING, error = null, connectionLost = false) }
         viewModelScope.launch {
-            val connected = try {
-                val (info, log) = repo.connect(_state.value.verbose)
-                _state.update {
-                    it.copy(
-                        phase = Phase.READY,
-                        info = info,
-                        readOnly = info.readOnly,
-                        localEnforce = repo.enforceState(),
-                        log = log,
-                    )
-                }
-                true
-            } catch (t: Throwable) {
-                _state.update {
-                    it.copy(
-                        phase = Phase.FAILED,
-                        error = describe(t),
-                        localEnforce = repo.enforceState(),
-                        log = it.log + repo.lastStartLog + repo.daemonLog(),
-                    )
-                }
-                false
+            if (!startSession()) return@launch
+            // Inline rather than open(): a failed read here must fall back to
+            // the root instead of leaving an error toast over an empty list.
+            val (path, entries) = runCatching { savedPath to repo.list(savedPath) }
+                .getOrElse { "/" to runCatching { repo.list("/") }.getOrDefault(emptyList()) }
+            _state.update {
+                val s = it.copy(path = path, entries = entries).withoutSheet()
+                if (path != savedPath) s.copy(searchActive = false, searchQuery = "") else s
             }
-            if (!connected) return@launch
-            // Inline rather than open(): that is its own work{} and would
-            // fight the CONNECTING phase over the busy flag.
-            val entries = runCatching { repo.list(savedPath) }.getOrNull()
-            if (entries != null) {
-                _state.update {
-                    val s = it.copy(path = savedPath, entries = entries).withoutSheet()
-                    if (savedPath != it.path) s.copy(searchActive = false, searchQuery = "") else s
-                }
-            } else {
-                val root = runCatching { repo.list("/") }.getOrDefault(emptyList())
-                _state.update {
-                    it.copy(path = "/", entries = root, searchActive = false, searchQuery = "")
-                        .withoutSheet()
-                }
+        }
+    }
+
+    /** Starts the helper and opens the modem session; true when it worked. */
+    private suspend fun startSession(): Boolean {
+        _state.update { it.copy(phase = Phase.CONNECTING, error = null) }
+        return try {
+            val (info, log) = repo.connect(_state.value.verbose)
+            _state.update {
+                it.copy(
+                    phase = Phase.READY,
+                    info = info,
+                    readOnly = info.readOnly,
+                    localEnforce = repo.enforceState(),
+                    log = log,
+                )
             }
+            true
+        } catch (t: Throwable) {
+            _state.update {
+                it.copy(
+                    phase = Phase.FAILED,
+                    error = describe(t),
+                    localEnforce = repo.enforceState(),
+                    log = it.log + repo.lastStartLog + repo.daemonLog(),
+                )
+            }
+            false
         }
     }
 
@@ -453,11 +419,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
         } catch (t: Throwable) {
             if (t is CancellationException) throw t
-            val lost = isConnectionLoss(t)
             _state.update { s ->
-                val c = if (lost) s.copy(connectionLost = true) else s
-                if (c.detail?.path != path) c
-                else c.copy(previewError = describe(t), previewLoading = false)
+                if (s.detail?.path != path) s
+                else s.copy(previewError = describe(t), previewLoading = false)
             }
         }
     }
@@ -589,8 +553,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // NV-writing actor may run at a time.
 
     fun startBulkImport(uri: Uri) = viewModelScope.launch {
-        // A fresh dialog re-arms the SSR button: the Done! state belongs to
-        // the dialog instance that ran the restart.
         _state.update { it.copy(ssrDone = false) }
         val name = repo.displayName(uri)
         var readError: String? = null
@@ -645,11 +607,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val unlocked = try {
                     repo.spcUnlock(spc)
                 } catch (t: Throwable) {
-                    val lost = isConnectionLoss(t)
                     _state.update { s ->
-                        val c = if (lost) s.copy(connectionLost = true) else s
-                        if (c.bulk == null) c
-                        else c.copy(bulk = preview.copy(error = "SPC pre-flight failed: ${describe(t)}"))
+                        if (s.bulk == null) s
+                        else s.copy(bulk = preview.copy(error = "SPC pre-flight failed: ${describe(t)}"))
                     }
                     return@launch
                 }
@@ -688,10 +648,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 } catch (t: Throwable) {
                     if (t is CancellationException) throw t
-                    if (isConnectionLoss(t)) {
-                        aborted = true
-                        _state.update { it.copy(connectionLost = true) }
-                    }
+                    if (t is EfsException &&
+                        (!repo.connected || t.message?.contains("closed the connection") == true)
+                    ) aborted = true
                     BulkResult(cmd.op, cmd.efsPath, cmd.simTag, ok = false, error = describe(t))
                 }
                 results.add(result)
@@ -718,21 +677,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun modemSsr() = work("restarting the modem") {
         var reconnected = false
-        var lost = false
         val msg = try {
             reconnected = repo.modemSsr()
             if (reconnected) "Modem restarted - EFS changes are committed and live"
-            else "Modem restarted, but the session did not come back - reconnect"
+            else "Modem restarted, but the session did not come back - use Reconnect in the menu"
         } catch (t: Throwable) {
-            lost = isConnectionLoss(t)
             describe(t)
         }
-        // A plain refusal (read-only lock, journal-flush refusal) comes over a
-        // LIVE session and must not enable Reconnect; only a transport-shaped
-        // failure or a completed reply without a reconnection says the
-        // connection is gone.  ssrDone's explicit false re-arms a dialog
-        // button that ran an earlier successful restart.
-        _state.update { it.copy(connectionLost = lost || !reconnected, ssrDone = reconnected) }
+        _state.update { it.copy(ssrDone = reconnected) }
         // The listing was read from the modem that just went away, so pull it
         // again over the fresh session rather than leaving stale entries up.
         // Inline rather than open(): that is its own work{} and would fight
@@ -766,8 +718,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (featuresJob?.isActive == true) return
         if (bulkRun?.isActive == true) return
         featuresJob = viewModelScope.launch {
-            // A fresh dialog re-arms the SSR button: the Done! state belongs
-            // to the dialog instance that ran the restart.
             _state.update { it.copy(features = FeaturesState.Checking(DEFAULT_FEATURE_SLOT), ssrDone = false) }
             checkFeatures(DEFAULT_FEATURE_SLOT)
         }
@@ -813,11 +763,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
         } catch (t: Throwable) {
             if (t is CancellationException) throw t
-            val lost = isConnectionLoss(t)
-            _state.update {
-                it.copy(features = null, toast = describe(t),
-                    connectionLost = it.connectionLost || lost)
-            }
+            _state.update { it.copy(features = null, toast = describe(t)) }
         }
     }
 
@@ -834,11 +780,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             // The last check only says what to write; what the write really
             // left behind is read back below.
             updateStatus(feature.id, FeatureStatus.Writing)
+            // This change needs a restart of its own: an earlier "Done!" no
+            // longer speaks for what the dialog shows.
+            _state.update { it.copy(ssrDone = false) }
             val error = try {
                 withContext(Dispatchers.IO) { featureChecker.disable(feature, ready.simSlot) }
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
-                if (isConnectionLoss(t)) _state.update { it.copy(connectionLost = true) }
                 updateStatus(feature.id, FeatureStatus.WriteError(describe(t)))
                 return@launch
             }
@@ -893,7 +841,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             withContext(Dispatchers.IO) { repo.spcUnlock(spc) }
         } catch (t: Throwable) {
             if (t is CancellationException) throw t
-            if (isConnectionLoss(t)) _state.update { it.copy(connectionLost = true) }
             onReject("SPC pre-flight failed: ${describe(t)}")
             return false
         }
@@ -997,11 +944,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val res = repo.nvRead(item, index)
             _state.update { it.copy(nv = res, nvError = null) }
         } catch (t: Throwable) {
-            val lost = isConnectionLoss(t)
-            _state.update {
-                it.copy(nv = null, nvError = describe(t),
-                    connectionLost = it.connectionLost || lost)
-            }
+            _state.update { it.copy(nv = null, nvError = describe(t)) }
         }
     }
 
@@ -1018,7 +961,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             if (repo.spcUnlock(spc)) "SPC accepted - NV writes are unlocked"
             else "SPC rejected - the modem did not accept that code"
         } catch (t: Throwable) {
-            if (isConnectionLoss(t)) _state.update { it.copy(connectionLost = true) }
             describe(t)
         }
         // The dialog covers the snackbar, so the SPC test's feedback goes into

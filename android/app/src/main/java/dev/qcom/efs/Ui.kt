@@ -243,14 +243,12 @@ fun App(vm: MainViewModel) {
                                 onClick = { menu = false; vm.checkForUpdates(manual = true) },
                             )
                             if (state.phase == Phase.READY) {
-                                // Greyed while the session works: reconnecting
-                                // over a live connection would only churn the
-                                // helper.  It lights up once a failed operation
-                                // proved the connection dead.
+                                // Always offered: the app cannot reliably tell a
+                                // dead session from a live one, and a restart of
+                                // a healthy helper costs next to nothing.
                                 DropdownMenuItem(
                                     text = { Text("Reconnect") },
                                     leadingIcon = { Icon(Icons.Filled.Link, null) },
-                                    enabled = state.connectionLost,
                                     onClick = { menu = false; vm.reconnect() },
                                 )
                                 DropdownMenuItem(
