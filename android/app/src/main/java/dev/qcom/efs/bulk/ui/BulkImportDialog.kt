@@ -44,6 +44,8 @@ import dev.qcom.efs.bulk.BulkOp
 fun BulkImportDialog(
     state: BulkState,
     readOnly: Boolean,
+    busy: Boolean,
+    ssrDone: Boolean,
     onSpcUnlock: (String) -> Unit,
     onEnableWrites: () -> Unit,
     onStart: (String) -> Unit,
@@ -58,7 +60,7 @@ fun BulkImportDialog(
                 when (state) {
                     is BulkState.Preview -> PreviewBody(state, readOnly, onStart, onSpcUnlock, onEnableWrites)
                     is BulkState.Running -> RunningBody(state)
-                    is BulkState.Done -> DoneBody(state, onSsr)
+                    is BulkState.Done -> DoneBody(state, busy, ssrDone, onSsr)
                 }
             }
         },
@@ -146,11 +148,9 @@ private fun RunningBody(state: BulkState.Running) {
 }
 
 @Composable
-private fun DoneBody(state: BulkState.Done, onSsr: () -> Unit) {
+private fun DoneBody(state: BulkState.Done, busy: Boolean, ssrDone: Boolean, onSsr: () -> Unit) {
     val ok = state.results.count { it.ok }
     val fail = state.results.size - ok
-    var ssrBusy by remember { mutableStateOf(false) }
-    LaunchedEffect(state.note) { ssrBusy = false }
 
     Text(
         "Done — $ok OK, $fail FAIL",
@@ -173,12 +173,15 @@ private fun DoneBody(state: BulkState.Done, onSsr: () -> Unit) {
         )
     }
     if (fail == 0) {
+        // Enabled purely off the shared busy flag (same as the features
+        // dialog): the SSR is a work{} launch, so the flag clears exactly
+        // once the attempt finishes, success or failure.
         Button(
-            onClick = { ssrBusy = true; onSsr() },
-            enabled = !ssrBusy,
+            onClick = onSsr,
+            enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text("Restart modem (SSR)")
+            Text("Restart modem (SSR)" + if (ssrDone) " - Done!" else "")
         }
     }
     ResultList(state.results)

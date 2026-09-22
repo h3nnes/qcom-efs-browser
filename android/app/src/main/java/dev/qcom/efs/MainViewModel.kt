@@ -154,6 +154,13 @@ data class UiState(
     val update: Release? = null,
     /** Set once the session is closed and the activity should finish. */
     val exitAfterDisconnect: Boolean = false,
+    /**
+     * True once a modem restart came back with a live session, so the SSR
+     * button in the bulk-import and features dialogs can say "Done!".  It
+     * belongs to the changes made before that restart: opening either dialog
+     * or writing a new feature clears it again.
+     */
+    val ssrDone: Boolean = false,
 )
 
 /**
@@ -234,30 +241,59 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun connect() {
         if (_state.value.phase == Phase.CONNECTING) return
-        _state.update { it.copy(phase = Phase.CONNECTING, error = null) }
+        viewModelScope.launch { if (startSession()) open("/") }
+    }
+
+    /**
+     * Starts a fresh helper and session from inside the browser, and puts the
+     * user back in the folder they were in -- or on the root, when that folder
+     * is gone or unreadable.  Always offered rather than only after a detected
+     * failure: a dead helper is not the only way to end up with a useless
+     * session (a modem restart sent as a raw packet leaves the helper talking
+     * to the modem that went away), and restarting a healthy helper costs two
+     * seconds and puts the read-only lock back on, nothing more.
+     */
+    fun reconnect() {
+        if (_state.value.phase == Phase.CONNECTING) return
+        val savedPath = _state.value.path
         viewModelScope.launch {
-            try {
-                val (info, log) = repo.connect(_state.value.verbose)
-                _state.update {
-                    it.copy(
-                        phase = Phase.READY,
-                        info = info,
-                        readOnly = info.readOnly,
-                        localEnforce = repo.enforceState(),
-                        log = log,
-                    )
-                }
-                open("/")
-            } catch (t: Throwable) {
-                _state.update {
-                    it.copy(
-                        phase = Phase.FAILED,
-                        error = describe(t),
-                        localEnforce = repo.enforceState(),
-                        log = it.log + repo.lastStartLog + repo.daemonLog(),
-                    )
-                }
+            if (!startSession()) return@launch
+            // Inline rather than open(): a failed read here must fall back to
+            // the root instead of leaving an error toast over an empty list.
+            val (path, entries) = runCatching { savedPath to repo.list(savedPath) }
+                .getOrElse { "/" to runCatching { repo.list("/") }.getOrDefault(emptyList()) }
+            _state.update {
+                val s = it.copy(path = path, entries = entries).withoutSheet()
+                if (path != savedPath) s.copy(searchActive = false, searchQuery = "") else s
             }
+        }
+    }
+
+    /** Starts the helper and opens the modem session; true when it worked. */
+    private suspend fun startSession(): Boolean {
+        _state.update { it.copy(phase = Phase.CONNECTING, error = null) }
+        return try {
+            val (info, log) = repo.connect(_state.value.verbose)
+            _state.update {
+                it.copy(
+                    phase = Phase.READY,
+                    info = info,
+                    readOnly = info.readOnly,
+                    localEnforce = repo.enforceState(),
+                    log = log,
+                )
+            }
+            true
+        } catch (t: Throwable) {
+            _state.update {
+                it.copy(
+                    phase = Phase.FAILED,
+                    error = describe(t),
+                    localEnforce = repo.enforceState(),
+                    log = it.log + repo.lastStartLog + repo.daemonLog(),
+                )
+            }
+            false
         }
     }
 
@@ -517,6 +553,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // NV-writing actor may run at a time.
 
     fun startBulkImport(uri: Uri) = viewModelScope.launch {
+        _state.update { it.copy(ssrDone = false) }
         val name = repo.displayName(uri)
         var readError: String? = null
         val text = withContext(Dispatchers.IO) {
@@ -643,10 +680,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val msg = try {
             reconnected = repo.modemSsr()
             if (reconnected) "Modem restarted - EFS changes are committed and live"
-            else "Modem restarted, but the session did not come back - reconnect"
+            else "Modem restarted, but the session did not come back - use Reconnect in the menu"
         } catch (t: Throwable) {
             describe(t)
         }
+        _state.update { it.copy(ssrDone = reconnected) }
         // The listing was read from the modem that just went away, so pull it
         // again over the fresh session rather than leaving stale entries up.
         // Inline rather than open(): that is its own work{} and would fight
@@ -680,7 +718,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (featuresJob?.isActive == true) return
         if (bulkRun?.isActive == true) return
         featuresJob = viewModelScope.launch {
-            _state.update { it.copy(features = FeaturesState.Checking(DEFAULT_FEATURE_SLOT)) }
+            _state.update { it.copy(features = FeaturesState.Checking(DEFAULT_FEATURE_SLOT), ssrDone = false) }
             checkFeatures(DEFAULT_FEATURE_SLOT)
         }
     }
@@ -742,6 +780,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             // The last check only says what to write; what the write really
             // left behind is read back below.
             updateStatus(feature.id, FeatureStatus.Writing)
+            // This change needs a restart of its own: an earlier "Done!" no
+            // longer speaks for what the dialog shows.
+            _state.update { it.copy(ssrDone = false) }
             val error = try {
                 withContext(Dispatchers.IO) { featureChecker.disable(feature, ready.simSlot) }
             } catch (t: Throwable) {
