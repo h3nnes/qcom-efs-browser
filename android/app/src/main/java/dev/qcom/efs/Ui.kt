@@ -243,6 +243,14 @@ fun App(vm: MainViewModel) {
                                 onClick = { menu = false; vm.checkForUpdates(manual = true) },
                             )
                             if (state.phase == Phase.READY) {
+                                // Always offered: the app cannot reliably tell a
+                                // dead session from a live one, and a restart of
+                                // a healthy helper costs next to nothing.
+                                DropdownMenuItem(
+                                    text = { Text("Reconnect") },
+                                    leadingIcon = { Icon(Icons.Filled.Link, null) },
+                                    onClick = { menu = false; vm.reconnect() },
+                                )
                                 DropdownMenuItem(
                                     text = { Text("Disconnect") },
                                     leadingIcon = { Icon(Icons.Filled.PowerSettingsNew, null) },
@@ -340,6 +348,8 @@ fun App(vm: MainViewModel) {
         BulkImportDialog(
             state = bulk,
             readOnly = state.readOnly,
+            busy = state.busy,
+            ssrDone = state.ssrDone,
             onSpcUnlock = { spc -> vm.spcUnlock(spc) },
             onEnableWrites = { vm.toggleReadOnly() },
             onStart = { spc -> vm.runBulkImport(spc) },
@@ -353,6 +363,7 @@ fun App(vm: MainViewModel) {
             state = features,
             readOnly = state.readOnly,
             busy = state.busy,
+            ssrDone = state.ssrDone,
             onSimSlot = { slot -> vm.setFeatureSimSlot(slot) },
             onEnableWrites = { vm.toggleReadOnly() },
             onDisable = { id, spc -> vm.disableFeature(id, spc) },

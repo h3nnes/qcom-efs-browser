@@ -9,6 +9,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.Closeable
+import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStream
 
@@ -68,10 +69,22 @@ class EfsClient : Closeable {
             val out = writer ?: throw EfsException("not connected to the helper")
             val rd = reader ?: throw EfsException("not connected to the helper")
 
-            out.write((payload.toString() + "\n").toByteArray(Charsets.UTF_8))
-            out.flush()
-
-            val line = rd.readLine() ?: throw EfsException("the helper closed the connection")
+            // A helper that died leaves a socket that still reports itself
+            // connected; the first write then fails with a bare "Broken pipe".
+            // Say what that means, and drop the socket so isConnected tells
+            // the truth from here on.  A read that timed out is dropped too:
+            // its late answer would otherwise be taken for the next request's.
+            val line = try {
+                out.write((payload.toString() + "\n").toByteArray(Charsets.UTF_8))
+                out.flush()
+                rd.readLine()
+            } catch (e: IOException) {
+                closeLocked()
+                throw EfsException("lost the connection to the helper (${e.message}) - use Reconnect in the menu")
+            } ?: run {
+                closeLocked()
+                throw EfsException("the helper closed the connection - use Reconnect in the menu")
+            }
             try {
                 JSONObject(line)
             } catch (t: Throwable) {
